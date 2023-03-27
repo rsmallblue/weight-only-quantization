@@ -116,8 +116,6 @@ inline void dequant(int8_t* B, float* b, __m512 float_zero_point, __m512 float_s
     const __m128i b_ = _mm_loadu_si128((const __m128i*)B);
     __m512 vb;
     vb = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(b_));
-    //__m512 float_scale = _mm512_set1_ps(scale);
-    //__m512 float_zero_point = _mm512_set1_ps(zero_point);
     vb = _mm512_sub_ps(vb, float_zero_point);
     vb = _mm512_mul_ps(vb, float_scale);   
     _mm512_storeu_ps(b, vb); 
@@ -148,13 +146,15 @@ void pack_and_dequant(int8_t* B, float* b, int K, int N, int ldb, float zero_poi
     __m512 float_scale = _mm512_set1_ps(scale);
     __m512 float_zero_point = _mm512_set1_ps(zero_point);
     const int COLS = N/16;
-    int8_t* src = B;
-    float* dst = b;
+
     for(int k = 0 ; k < K ; k++){
-        dequant(B, b, float_zero_point, float_scale);
-        dequant(B+16, b+16, float_zero_point, float_scale);
-        dequant(B+32, b+32, float_zero_point, float_scale);
-        dequant(B+48, b+48, float_zero_point, float_scale);
+        int8_t* src = B;
+        float* dst = b;  
+        for(int j = 0; j < COLS; j++){
+            dequant(src, dst, float_zero_point, float_scale);  
+            src += 16;
+            dst += 16;          
+        }      
         B += ldb;
         b += 64;
     }
@@ -176,15 +176,14 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
             int nb_start = nb * BLOCK_N;
             int n_bs = std::min(BLOCK_N, N-nb_start);
             float* C_offset = PTR_OFFSET(C, mb_start, nb_start, ldc);
-            //zero_fill(C_offset, m_bs, n_bs, ldc);
+            zero_fill(C_offset, m_bs, n_bs, ldc);
             for(int kb = 0; kb < KB; kb++){
                 int kb_start = kb * BLOCK_K;
                 int k_bs = std::min(BLOCK_K, K-kb_start);
                 float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
                 int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, ldb);
                 float* bi_offset = b_offset + kb_start *ldb +nb * BLOCK_K*BLOCK_N; 
-                float* b_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float)); 
-                pack_and_dequant(B_offset, b_offset, BLOCK_K, BLOCK_N, ldb, zero_point, scale);
+                pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point, scale);
                 dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
                     bi_offset,
                     A_offset,
@@ -309,8 +308,8 @@ void test_gemm(int M, int N, int K) {
 int main() {
     int mnk[][3] = {
         {4, 4096, 4096},
-        // {4, 4096, 16384},
-        // {4, 16384, 4096},
+        {4, 4096, 16384},
+        {4, 16384, 4096},
     };
 
 
