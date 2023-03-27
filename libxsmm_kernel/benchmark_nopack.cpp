@@ -142,25 +142,25 @@ inline void dequant(int8_t* B, float* b, __m512 float_zero_point, __m512 float_s
 //     free(bi);
 // }
 
-void pack_and_dequant(int8_t* B, float* b, int K, int N, int ldb, float zero_point, float scale){
-    __m512 float_scale = _mm512_set1_ps(scale);
-    __m512 float_zero_point = _mm512_set1_ps(zero_point);
-    const int COLS = N/16;
+void pack_and_dequant(int8_t* B, float* b, int K, int N, int ldb, float* zero_point, float* scale){
+    //const int COLS = N/16;
 
     for(int k = 0 ; k < K ; k++){
         int8_t* src = B;
         float* dst = b;  
-        for(int j = 0; j < COLS; j++){
+        for(int j = 0; j < N; j+=16){
+            __m512 float_scale = _mm512_loadu_ps(scale+j);
+            __m512 float_zero_point = _mm512_loadu_ps(zero_point+j);            
             dequant(src, dst, float_zero_point, float_scale);  
             src += 16;
             dst += 16;          
         }      
         B += ldb;
-        b += 64;
+        b += N;
     }
 }
 
-void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ldb, int ldc, float zero_point, float scale){
+void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ldb, int ldc, float* zero_point, float* scale){
 #define PTR_OFFSET(base, offset0, offset1, stride0)\
     (base) + (offset0)*(stride0) + (offset1)
 
@@ -183,7 +183,7 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
                 float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
                 int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, ldb);
                 float* bi_offset = b_offset + kb_start *ldb +nb * BLOCK_K*BLOCK_N; 
-                pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point, scale);
+                pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point+nb_start, scale+nb_start);
                 dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
                     bi_offset,
                     A_offset,
@@ -211,6 +211,7 @@ float benchmark_mkl(int M, int N, int K){
     test_utils::init(B, K * ldb);
     test_utils::init(C, M * ldc);
 
+
     for (int i = 0; i < 10; ++i) {
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
             M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
@@ -237,7 +238,6 @@ void benchmark_libxsmm(int M, int N, int K){
     const int lda = K;
     const int ldb = N;
     const int ldc = N;
-    float zero_point = 0.0, scale = 1.0;
 
     float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
     int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
@@ -246,6 +246,14 @@ void benchmark_libxsmm(int M, int N, int K){
     test_utils::init(A, M * lda);
     test_utils::init_int8(B, K * ldb);
     test_utils::init(C, M * ldc);  
+
+    float* zero_point = (float *)aligned_alloc(64, N * sizeof(float));
+    float* scale = (float *)aligned_alloc(64, N * sizeof(float));  
+
+    for(int i = 0 ; i < N; i++){
+        zero_point[i] = 0.0;
+        scale[i] = 1.0;
+    }  
 
     
     my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
@@ -275,7 +283,6 @@ void test_gemm(int M, int N, int K) {
     int lda = K;
     int ldb = N;
     int ldc = N;
-    float zero_point = 0.0, scale = 1.0;
 
     float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
     int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
@@ -286,6 +293,14 @@ void test_gemm(int M, int N, int K) {
 
     test_utils::init(A, M * lda);
     test_utils::init_int8(B, K * ldb);
+
+    float* zero_point = (float *)aligned_alloc(64, N * sizeof(float));
+    float* scale = (float *)aligned_alloc(64, N * sizeof(float));  
+
+    for(int i = 0 ; i < N; i++){
+        zero_point[i] = 0.0;
+        scale[i] = 1.0;
+    }  
 
     test_utils::gemm_ref_int8(A, B, refC, M, N, K, lda, ldb, ldc, false);
     my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
@@ -302,13 +317,15 @@ void test_gemm(int M, int N, int K) {
     free(B);
     free(C);
     free(refC);
+    free(zero_point);
+    free(scale);
 }
 
 
 int main() {
     int mnk[][3] = {
-        {4, 4096, 4096},
-        {4, 4096, 16384},
+        // {4, 4096, 4096},
+        // {4, 4096, 16384},
         {4, 16384, 4096},
     };
 
