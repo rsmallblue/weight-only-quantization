@@ -143,8 +143,6 @@ inline void dequant(int8_t* B, float* b, __m512 float_zero_point, __m512 float_s
 // }
 
 void pack_and_dequant(int8_t* B, float* b, int K, int N, int ldb, float* zero_point, float* scale){
-    //const int COLS = N/16;
-
     for(int k = 0 ; k < K ; k++){
         int8_t* src = B;
         float* dst = b;  
@@ -164,9 +162,8 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
 #define PTR_OFFSET(base, offset0, offset1, stride0)\
     (base) + (offset0)*(stride0) + (offset1)
 
-    const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 1024; //BLOCK_N must a multiple of 64
+    const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 512; //BLOCK_N must a multiple of 16
     const int MB = (M + BLOCK_M -1)/BLOCK_M, NB = (N + BLOCK_N - 1)/BLOCK_N, KB = (K + BLOCK_K -1)/BLOCK_K;
-    float* b_offset = (float *)aligned_alloc(64, K * N * sizeof(float)); 
 
     #pragma omp parallel for collapse(2)
     for(int mb = 0 ; mb < MB; mb++){
@@ -182,7 +179,7 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
                 int k_bs = std::min(BLOCK_K, K-kb_start);
                 float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
                 int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, ldb);
-                float* bi_offset = b_offset + kb_start *ldb +nb * BLOCK_K*BLOCK_N; 
+                float* bi_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float)); 
                 pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point+nb_start, scale+nb_start);
                 dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
                     bi_offset,
@@ -190,7 +187,9 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
                     C_offset,
                     false, false,
                     BLOCK_N, lda, ldc
-                );                    
+                );
+                free(bi_offset);
+
             }
 
         }
@@ -275,6 +274,8 @@ void benchmark_libxsmm(int M, int N, int K){
     free(A);
     free(B);
     free(C);  
+    free(zero_point);
+    free(scale);
 }
 
 
@@ -302,6 +303,7 @@ void test_gemm(int M, int N, int K) {
         scale[i] = 1.0;
     }  
 
+
     test_utils::gemm_ref_int8(A, B, refC, M, N, K, lda, ldb, ldc, false);
     my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
 
@@ -324,8 +326,8 @@ void test_gemm(int M, int N, int K) {
 
 int main() {
     int mnk[][3] = {
-        // {4, 4096, 4096},
-        // {4, 4096, 16384},
+        {4, 4096, 4096},
+        {4, 4096, 16384},
         {4, 16384, 4096},
     };
 
