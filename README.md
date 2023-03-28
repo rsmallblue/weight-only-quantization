@@ -1,2 +1,2 @@
 # weight-only-quantization
-per tensor
+per channel
