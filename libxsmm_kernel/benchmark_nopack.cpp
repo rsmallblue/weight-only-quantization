@@ -166,6 +166,7 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
     const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 512; //BLOCK_N must a multiple of 64
     const int MB = (M + BLOCK_M -1)/BLOCK_M, NB = (N + BLOCK_N - 1)/BLOCK_N, KB = (K + BLOCK_K -1)/BLOCK_K;
 
+
     #pragma omp parallel for collapse(2)
     for(int mb = 0 ; mb < MB; mb++){
         for(int nb = 0 ; nb < NB; nb++){
@@ -175,12 +176,12 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
             int n_bs = std::min(BLOCK_N, N-nb_start);
             float* C_offset = PTR_OFFSET(C, mb_start, nb_start, ldc);
             zero_fill(C_offset, m_bs, n_bs, ldc);
+            float* bi_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float));             
             for(int kb = 0; kb < KB; kb++){
                 int kb_start = kb * BLOCK_K;
                 int k_bs = std::min(BLOCK_K, K-kb_start);
                 float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
                 int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, ldb);
-                float* bi_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float)); 
                 pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point, scale);
                 dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
                     bi_offset,
@@ -188,12 +189,13 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
                     C_offset,
                     false, false,
                     BLOCK_N, lda, ldc
-                );
-                free(bi_offset);                    
+                );                   
             }
+            free(bi_offset);              
 
         }
     }
+   
 }
 
 
@@ -224,7 +226,7 @@ float benchmark_mkl(int M, int N, int K){
 
     float latency = t.getTime();
     float gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
-    printf("mkl_sgemm, M: %d, N: %d, K: %d, time: %.2f ms, perf: %.2f gflops\n", M, N, K, latency / loops, gflops);
+    printf("mkl_sgemm, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
 
     free(A);
     free(B);
@@ -261,7 +263,7 @@ void benchmark_libxsmm(int M, int N, int K){
 
     float latency = t.getTime();
     float gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
-    printf("libxsmm_kernel, M: %d, N: %d, K: %d, time: %.2f ms, perf: %.2f gflops\n", M, N, K, latency / loops, gflops);
+    printf("libxsmm_kernel, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
 
     free(A);
     free(B);
