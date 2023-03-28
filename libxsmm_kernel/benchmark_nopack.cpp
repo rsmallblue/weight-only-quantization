@@ -174,12 +174,12 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
             int n_bs = std::min(BLOCK_N, N-nb_start);
             float* C_offset = PTR_OFFSET(C, mb_start, nb_start, ldc);
             zero_fill(C_offset, m_bs, n_bs, ldc);
+            float* bi_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float));             
             for(int kb = 0; kb < KB; kb++){
                 int kb_start = kb * BLOCK_K;
                 int k_bs = std::min(BLOCK_K, K-kb_start);
                 float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
                 int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, ldb);
-                float* bi_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float)); 
                 pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point+nb_start, scale+nb_start);
                 dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
                     bi_offset,
@@ -188,10 +188,9 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
                     false, false,
                     BLOCK_N, lda, ldc
                 );
-                free(bi_offset);
 
             }
-
+            free(bi_offset);
         }
     }
 }
