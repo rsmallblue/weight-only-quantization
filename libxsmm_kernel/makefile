@@ -30,11 +30,14 @@ ifeq "$(GCCVERSIONGTEQ7)" "0"
 endif
 
 
-benchmark: benchmark_nopack
+benchmark: benchmark_nopack benchmark_packb
 
 
 benchmark_nopack: benchmark_nopack.cpp 
 	$(CXX) $(CFLAGS) benchmark_nopack.cpp  -o benchmark_nopack -lmkl_rt  -lxsmm -I/home2/xiaolany/libxsmm/include -L/home2/xiaolany/libxsmm/lib
+
+benchmark_packb: benchmark_packb.cpp
+	$(CXX) $(CFLAGS) benchmark_packb.cpp  -o benchmark_packb -lmkl_rt  -lxsmm -I/home2/xiaolany/libxsmm/include -L/home2/xiaolany/libxsmm/lib
 
 clean:
 	rm -rf sgemm_simple.o  libsgemm.so \

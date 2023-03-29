@@ -10,6 +10,9 @@
 #include <immintrin.h>
 #include <emmintrin.h>
 
+const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 1024;
+
+
 struct DotMicroKernelKey {
     bool trans_a;
     bool trans_b;
@@ -112,7 +115,7 @@ void zero_fill(float* C, int M, int N, int stride){
     }
 }
 
-inline void dequant(int8_t* B, float* b, __m512 float_zero_point, __m512 float_scale){
+inline void dequant_(int8_t* B, float* b, __m512 float_zero_point, __m512 float_scale){
     const __m128i b_ = _mm_loadu_si128((const __m128i*)B);
     __m512 vb;
     vb = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(b_));
@@ -142,18 +145,94 @@ inline void dequant(int8_t* B, float* b, __m512 float_zero_point, __m512 float_s
 //     free(bi);
 // }
 
-void pack_and_dequant(int8_t* B, float* b, int K, int N, int ldb, float* zero_point, float* scale){
+// inline void pack_(int8_t* B, int8_t* b, int ldb){
+//     for(int k = 0 ; k < BLOCK_K ; k++){
+//         int8_t* src = B;
+//         int8_t* dst = b;  
+//         for(int j = 0; j < BLOCK_N; j++){
+//             dst[j] = src[j];        
+//         }      
+//         B += ldb;
+//         b += BLOCK_N;
+//     }
+// }
+// void pack(int8_t* B, int8_t* B_pack, int K, int N){
+// #define PTR_OFFSET(base, offset0, offset1, stride0)\
+//     (base) + (offset0)*(stride0) + (offset1)
+//     const int NB = (N + BLOCK_N - 1)/BLOCK_N, KB = (K + BLOCK_K -1)/BLOCK_K;
+//     #pragma omp parallel for collapse(2)    
+//     for(int nb = 0 ; nb < NB; nb++){        
+//         for(int kb = 0; kb < KB; kb++){
+//             int nb_start = nb * BLOCK_N;
+//             int n_bs = std::min(BLOCK_N, N-nb_start);              
+//             int kb_start = kb * BLOCK_K;
+//             int k_bs = std::min(BLOCK_K, K-kb_start);
+//             int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, N);
+//             int8_t* b_offset = B_pack + nb_start*K + kb_start*NB;
+//             //std::cout<<"nb:"<<nb<<"kb"<<kb<<"offset"<<nb_start*K + kb_start*NB<<std::endl;
+//             pack_(B_offset, b_offset, N);
+//         }
+//     }
+// }
+
+void pack(int8_t *B, int8_t *packedB, int K, int N, int ldb, bool transB) {
+    const int blks = (N + 63) / BLOCK_N;
+
+    // B is not transposed, shape: K x N
+    if (!transB) {
+#pragma omp parallel for
+        for (int i = 0; i < blks; ++i) {
+            int cols = 64;        // each time pack 64 columns
+            if (i == blks - 1) {  // last block
+                cols = N - i * 64;
+            }
+
+            const int8_t *psrc = B + i * 64;
+            int8_t *pdst = packedB + i * K * 64;
+
+            for (int r = 0; r < K; ++r) {
+                memcpy(pdst, psrc, cols * sizeof(int8_t));
+                psrc += ldb;
+                pdst += cols;
+            }
+        }
+    }
+
+    // B is transposed, shape: N x K
+    else {
+#pragma omp parallel for
+        for (int i = 0; i < blks; ++i) {
+            int rows = 64;        // each time pack 64 elements in N dimension
+            if (i == blks - 1) {  // last block
+                rows = N - i * 64;
+            }
+
+            const int8_t *psrc = B + i * 64 * ldb;
+            int8_t *pdst = packedB + i * K * 64;
+
+            for (int c = 0; c < K; ++c) {
+                for (int r = 0; r < rows; ++r) {
+                    pdst[r] = psrc[r * ldb];
+                }
+                psrc += 1;
+                pdst += rows;
+            }
+        }
+    }
+}
+
+void dequant(int8_t* B, float* b, int K, int N, int ldb, float* zero_point, float* scale){
     for(int k = 0 ; k < K ; k++){
         int8_t* src = B;
         float* dst = b;  
         for(int j = 0; j < N; j+=16){
             __m512 float_scale = _mm512_loadu_ps(scale+j);
             __m512 float_zero_point = _mm512_loadu_ps(zero_point+j);            
-            dequant(src, dst, float_zero_point, float_scale);  
+            dequant_(src, dst, float_zero_point, float_scale);  
             src += 16;
             dst += 16;          
         }      
-        B += ldb;
+        B += N;
         b += N;
     }
 }
@@ -162,7 +241,7 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
 #define PTR_OFFSET(base, offset0, offset1, stride0)\
     (base) + (offset0)*(stride0) + (offset1)
 
-    const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 512; //BLOCK_N must a multiple of 16
+    //const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 1024; //BLOCK_N must a multiple of 16
     const int MB = (M + BLOCK_M -1)/BLOCK_M, NB = (N + BLOCK_N - 1)/BLOCK_N, KB = (K + BLOCK_K -1)/BLOCK_K;
 
     #pragma omp parallel for collapse(2)
@@ -179,8 +258,8 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
                 int kb_start = kb * BLOCK_K;
                 int k_bs = std::min(BLOCK_K, K-kb_start);
                 float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
-                int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, ldb);
-                pack_and_dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point+nb_start, scale+nb_start);
+                int8_t* B_offset = B + nb_start*K + kb_start*BLOCK_N;
+                dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point+nb_start, scale+nb_start);
                 dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
                     bi_offset,
                     A_offset,
@@ -239,6 +318,7 @@ void benchmark_libxsmm(int M, int N, int K){
 
     float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
     int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
+    int8_t *B_pack = (int8_t*)aligned_alloc(64, K * ldb * sizeof(int8_t));
     float *C = (float *)aligned_alloc(64, M * ldc * sizeof(float));
 
     test_utils::init(A, M * lda);
@@ -251,19 +331,21 @@ void benchmark_libxsmm(int M, int N, int K){
     for(int i = 0 ; i < N; i++){
         zero_point[i] = 0.0;
         scale[i] = 1.0;
-    }  
+    }
+
+    pack(B, B_pack, K, N, ldb, false);   
 
     
-    my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
+    my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
 
     for (int i = 0; i < 10; ++i) {
-        my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
+        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
     }
 
     Timer t;
     const int loops = 100;
     for (int i = 0; i < loops; ++i) {
-        my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
+        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
     }
 
     float latency = t.getTime();
@@ -272,6 +354,7 @@ void benchmark_libxsmm(int M, int N, int K){
 
     free(A);
     free(B);
+    free(B_pack);
     free(C);  
     free(zero_point);
     free(scale);
@@ -286,6 +369,7 @@ void test_gemm(int M, int N, int K) {
 
     float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
     int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
+    int8_t *B_pack = (int8_t*)aligned_alloc(64, K * ldb * sizeof(int8_t));
     float *C = (float *)aligned_alloc(64, M * ldc * sizeof(float));
     float *refC = (float *)aligned_alloc(64, M * ldc * sizeof(float));
     zero_fill(C, M, N, ldc);
@@ -302,9 +386,10 @@ void test_gemm(int M, int N, int K) {
         scale[i] = 1.0;
     }  
 
+    pack(B, B_pack, K, N, ldb, false);  
 
     test_utils::gemm_ref_int8(A, B, refC, M, N, K, lda, ldb, ldc, false);
-    my_gemm(A, B, C, M, N, K, lda, ldb, ldc, zero_point, scale);
+    my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
 
     if (!test_utils::is_same_matrix(refC, C, M, N, ldc, 0.0001f)) {
         int idx = test_utils::diff_index(refC, C, M, N, ldc, 0.0001f);
@@ -316,6 +401,7 @@ void test_gemm(int M, int N, int K) {
 
     free(A);
     free(B);
+    free(B_pack);
     free(C);
     free(refC);
     free(zero_point);
