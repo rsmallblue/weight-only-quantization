@@ -10,7 +10,7 @@
 #include <immintrin.h>
 #include <emmintrin.h>
 
-const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 1024;
+const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 512;
 
 
 struct DotMicroKernelKey {
@@ -79,6 +79,7 @@ private:
     libxsmm_gemm_param gemm_param_;
 };
 
+
 template<int BLOCK_M, int BLOCK_N, int BLOCK_K>
 using DotMicroKernelRef = std::shared_ptr<DotMicroKernel<BLOCK_M,BLOCK_N,BLOCK_K>>;
 
@@ -145,35 +146,7 @@ inline void dequant_(int8_t* B, float* b, __m512 float_zero_point, __m512 float_
 //     free(bi);
 // }
 
-// inline void pack_(int8_t* B, int8_t* b, int ldb){
-//     for(int k = 0 ; k < BLOCK_K ; k++){
-//         int8_t* src = B;
-//         int8_t* dst = b;  
-//         for(int j = 0; j < BLOCK_N; j++){
-//             dst[j] = src[j];        
-//         }      
-//         B += ldb;
-//         b += BLOCK_N;
-//     }
-// }
-// void pack(int8_t* B, int8_t* B_pack, int K, int N){
-// #define PTR_OFFSET(base, offset0, offset1, stride0)\
-//     (base) + (offset0)*(stride0) + (offset1)
-//     const int NB = (N + BLOCK_N - 1)/BLOCK_N, KB = (K + BLOCK_K -1)/BLOCK_K;
-//     #pragma omp parallel for collapse(2)    
-//     for(int nb = 0 ; nb < NB; nb++){        
-//         for(int kb = 0; kb < KB; kb++){
-//             int nb_start = nb * BLOCK_N;
-//             int n_bs = std::min(BLOCK_N, N-nb_start);              
-//             int kb_start = kb * BLOCK_K;
-//             int k_bs = std::min(BLOCK_K, K-kb_start);
-//             int8_t* B_offset = PTR_OFFSET(B, kb_start, nb_start, N);
-//             int8_t* b_offset = B_pack + nb_start*K + kb_start*NB;
-//             //std::cout<<"nb:"<<nb<<"kb"<<kb<<"offset"<<nb_start*K + kb_start*NB<<std::endl;
-//             pack_(B_offset, b_offset, N);
-//         }
-//     }
-// }
+
 
 void pack(int8_t *B, int8_t *packedB, int K, int N, int ldb, bool transB) {
     const int blks = (N + 63) / BLOCK_N;
@@ -221,6 +194,7 @@ void pack(int8_t *B, int8_t *packedB, int K, int N, int ldb, bool transB) {
     }
 }
 
+//per channel
 void dequant(int8_t* B, float* b, int K, int N, int ldb, float* zero_point, float* scale){
     for(int k = 0 ; k < K ; k++){
         int8_t* src = B;
@@ -237,6 +211,24 @@ void dequant(int8_t* B, float* b, int K, int N, int ldb, float* zero_point, floa
     }
 }
 
+//per tensor
+void dequant(int8_t* B, float* b, int K, int N, int ldb, float zero_point, float scale){
+    __m512 float_scale = _mm512_set1_ps(scale);
+    __m512 float_zero_point = _mm512_set1_ps(zero_point);    
+    for(int k = 0 ; k < K ; k++){
+        int8_t* src = B;
+        float* dst = b;  
+        for(int j = 0; j < N; j+=16){        
+            dequant_(src, dst, float_zero_point, float_scale);  
+            src += 16;
+            dst += 16;          
+        }      
+        B += N;
+        b += N;
+    }
+}
+
+//per channel
 void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ldb, int ldc, float* zero_point, float* scale){
 #define PTR_OFFSET(base, offset0, offset1, stride0)\
     (base) + (offset0)*(stride0) + (offset1)
@@ -275,41 +267,82 @@ void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ld
 }
 
 
-float benchmark_mkl(int M, int N, int K){
-    const int lda = K;
-    const int ldb = N;
-    const int ldc = N;
+//per tensor
+void my_gemm(float* A, int8_t* B, float* C, int M, int N, int K, int lda, int ldb, int ldc, float zero_point, float scale){
+#define PTR_OFFSET(base, offset0, offset1, stride0)\
+    (base) + (offset0)*(stride0) + (offset1)
 
-    float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
-    float *B = (float *)aligned_alloc(64, K * ldb * sizeof(float));
-    float *C = (float *)aligned_alloc(64, M * ldc * sizeof(float));
-
-    test_utils::init(A, M * lda);
-    test_utils::init(B, K * ldb);
-    test_utils::init(C, M * ldc);
+    //const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 512; //BLOCK_N must a multiple of 64
+    const int MB = (M + BLOCK_M -1)/BLOCK_M, NB = (N + BLOCK_N - 1)/BLOCK_N, KB = (K + BLOCK_K -1)/BLOCK_K;  //num of blks
 
 
-    for (int i = 0; i < 10; ++i) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
+    #pragma omp parallel for collapse(2)
+    for(int mb = 0 ; mb < MB; mb++){
+        for(int nb = 0 ; nb < NB; nb++){
+            int mb_start = mb * BLOCK_M;
+            int m_bs = std::min(BLOCK_M, M-mb_start);
+            int nb_start = nb * BLOCK_N;
+            int n_bs = std::min(BLOCK_N, N-nb_start);
+            float* C_offset = PTR_OFFSET(C, mb_start, nb_start, ldc);
+            zero_fill(C_offset, m_bs, n_bs, ldc);
+            float* bi_offset = (float *)aligned_alloc(64, BLOCK_K * BLOCK_N * sizeof(float));             
+            for(int kb = 0; kb < KB; kb++){
+                int kb_start = kb * BLOCK_K;
+                int k_bs = std::min(BLOCK_K, K-kb_start);
+                float* A_offset = PTR_OFFSET(A, mb_start, kb_start, lda);
+                int8_t* B_offset = B + nb_start*K + kb_start*BLOCK_N;
+                dequant(B_offset, bi_offset, BLOCK_K, BLOCK_N, ldb, zero_point, scale);
+                dot_tile_update<BLOCK_N,BLOCK_M,BLOCK_K>(
+                    bi_offset,
+                    A_offset,
+                    C_offset,
+                    false, false,
+                    BLOCK_N, lda, ldc
+                );                   
+            }
+            free(bi_offset);              
+
+        }
     }
-       
-    Timer t;
-    const int loops = 1000;
-    for (int i = 0; i < loops; ++i) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
-    }
-
-    float latency = t.getTime();
-    float gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
-    printf("mkl_sgemm, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
-
-    free(A);
-    free(B);
-    free(C);  
-    return gflops;
+   
 }
+
+
+// float benchmark_mkl(int M, int N, int K){
+//     const int lda = K;
+//     const int ldb = N;
+//     const int ldc = N;
+
+//     float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
+//     float *B = (float *)aligned_alloc(64, K * ldb * sizeof(float));
+//     float *C = (float *)aligned_alloc(64, M * ldc * sizeof(float));
+
+//     test_utils::init(A, M * lda);
+//     test_utils::init(B, K * ldb);
+//     test_utils::init(C, M * ldc);
+
+
+//     for (int i = 0; i < 10; ++i) {
+//         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+//             M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
+//     }
+       
+//     Timer t;
+//     const int loops = 1000;
+//     for (int i = 0; i < loops; ++i) {
+//         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+//             M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
+//     }
+
+//     float latency = t.getTime();
+//     float gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
+//     printf("mkl_sgemm, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
+
+//     free(A);
+//     free(B);
+//     free(C);  
+//     return gflops;
+// }
 
 void benchmark_libxsmm(int M, int N, int K){
     const int lda = K;
@@ -325,39 +358,60 @@ void benchmark_libxsmm(int M, int N, int K){
     test_utils::init_int8(B, K * ldb);
     test_utils::init(C, M * ldc);  
 
-    float* zero_point = (float *)aligned_alloc(64, N * sizeof(float));
-    float* scale = (float *)aligned_alloc(64, N * sizeof(float));  
+    pack(B, B_pack, K, N, ldb, false);  
+
+    //per channel
+    float* zero_point_per_channel = (float *)aligned_alloc(64, N * sizeof(float));
+    float* scale_per_channel = (float *)aligned_alloc(64, N * sizeof(float));  
 
     for(int i = 0 ; i < N; i++){
-        zero_point[i] = 0.0;
-        scale[i] = 1.0;
+        zero_point_per_channel[i] = 0.0;
+        scale_per_channel[i] = 1.0;
     }
 
-    pack(B, B_pack, K, N, ldb, false);   
-
-    
-    my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
-
+    //warmup
     for (int i = 0; i < 10; ++i) {
-        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
+        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel);
     }
 
-    Timer t;
+    Timer t1;
     const int loops = 100;
     for (int i = 0; i < loops; ++i) {
-        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
+        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel);
     }
 
-    float latency = t.getTime();
+    float latency = t1.getTime();
     float gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
-    printf("libxsmm_kernel, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
+    printf("libxsmm_kernel per_channel, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
+
+
+
+    //per tensor
+    float zero_point_per_tensor = 0.0;
+    float scale_per_tensor = 1.0;  
+
+
+    //warmup
+    for (int i = 0; i < 10; ++i) {
+        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_tensor, scale_per_tensor);
+    }
+
+    Timer t2;
+    for (int i = 0; i < loops; ++i) {
+        my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_tensor, scale_per_tensor);
+    }
+
+    latency = t2.getTime();
+    gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
+    printf("libxsmm_kernel per_tensor, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
+
 
     free(A);
     free(B);
     free(B_pack);
     free(C);  
-    free(zero_point);
-    free(scale);
+    free(zero_point_per_channel);
+    free(scale_per_channel);
 }
 
 
@@ -370,42 +424,66 @@ void test_gemm(int M, int N, int K) {
     float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
     int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
     int8_t *B_pack = (int8_t*)aligned_alloc(64, K * ldb * sizeof(int8_t));
-    float *C = (float *)aligned_alloc(64, M * ldc * sizeof(float));
     float *refC = (float *)aligned_alloc(64, M * ldc * sizeof(float));
-    zero_fill(C, M, N, ldc);
     zero_fill(refC, M, N, ldc);
 
     test_utils::init(A, M * lda);
     test_utils::init_int8(B, K * ldb);
-
-    float* zero_point = (float *)aligned_alloc(64, N * sizeof(float));
-    float* scale = (float *)aligned_alloc(64, N * sizeof(float));  
-
-    for(int i = 0 ; i < N; i++){
-        zero_point[i] = 0.0;
-        scale[i] = 1.0;
-    }  
+    test_utils::gemm_ref_int8(A, B, refC, M, N, K, lda, ldb, ldc, false);
 
     pack(B, B_pack, K, N, ldb, false);  
 
-    test_utils::gemm_ref_int8(A, B, refC, M, N, K, lda, ldb, ldc, false);
-    my_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point, scale);
 
-    if (!test_utils::is_same_matrix(refC, C, M, N, ldc, 0.0001f)) {
-        int idx = test_utils::diff_index(refC, C, M, N, ldc, 0.0001f);
-        printf("\tFailed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
-               M, N, K, lda, ldb, ldc, idx, refC[idx], idx, C[idx]);
+
+    //test per channel
+    float* zero_point_per_channel = (float *)aligned_alloc(64, N * sizeof(float));
+    float* scale_per_channel = (float *)aligned_alloc(64, N * sizeof(float));  
+    for(int i = 0 ; i < N; i++){
+        zero_point_per_channel[i] = 0.0;
+        scale_per_channel[i] = 1.0;
+    } 
+
+    float *C_per_channel = (float *)aligned_alloc(64, M * ldc * sizeof(float)); 
+
+    my_gemm(A, B_pack, C_per_channel, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel);
+
+    if (!test_utils::is_same_matrix(refC, C_per_channel, M, N, ldc, 0.0001f)) {
+        int idx = test_utils::diff_index(refC, C_per_channel, M, N, ldc, 0.0001f);
+        printf("\tper channel Failed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
+               M, N, K, lda, ldb, ldc, idx, refC[idx], idx, C_per_channel[idx]);
     } else {
-        printf("\tPassed: M=%d, N=%d, K=%d\n", M, N, K);
+        printf("\tper channel Passed: M=%d, N=%d, K=%d\n", M, N, K);
     }
+
+
+
+
+    //test per tensor
+    float zero_point_per_tensor = 0.0, scale_per_tensor = 1.0; 
+
+    float *C_per_tensor = (float *)aligned_alloc(64, M * ldc * sizeof(float)); 
+
+    my_gemm(A, B_pack, C_per_tensor, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel);
+
+    if (!test_utils::is_same_matrix(refC, C_per_tensor, M, N, ldc, 0.0001f)) {
+        int idx = test_utils::diff_index(refC, C_per_tensor, M, N, ldc, 0.0001f);
+        printf("\tper tensor Failed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
+               M, N, K, lda, ldb, ldc, idx, refC[idx], idx, C_per_tensor[idx]);
+    } else {
+        printf("\tper tensor Passed: M=%d, N=%d, K=%d\n", M, N, K);
+    }      
+
+
+
 
     free(A);
     free(B);
     free(B_pack);
-    free(C);
+    free(C_per_channel);
+    free(C_per_tensor);
     free(refC);
-    free(zero_point);
-    free(scale);
+    free(zero_point_per_channel);
+    free(scale_per_channel);
 }
 
 
