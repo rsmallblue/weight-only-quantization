@@ -206,12 +206,12 @@ inline void dequant_(int8_t* B, float* b, __m512 float_zero_point, __m512 float_
 void pack(int8_t *B, int8_t *packedB, int K, int N, int ldb, bool transB) {
     const int blks = (N + BLOCK_N - 1) / BLOCK_N;
     // B is not transposed, shape: K x N
-    // if (!transB) {
+    if (!transB) {
 #pragma omp parallel for
         for (int i = 0; i < blks; ++i) {
             int cols = BLOCK_N;        // each time pack BLOCK_N columns
             if (i == blks - 1) {  // last block
-                cols = N - i * 64;
+                cols = N - i * BLOCK_N;
             }
 
             const int8_t *psrc = B + i * BLOCK_N;
@@ -223,29 +223,29 @@ void pack(int8_t *B, int8_t *packedB, int K, int N, int ldb, bool transB) {
                 pdst += cols;
             }
         }
-    // }
+    }
 
-    // B is transposed, shape: N x K
-//     else {
-// #pragma omp parallel for
-//         for (int i = 0; i < blks; ++i) {
-//             int rows = 64;        // each time pack 64 elements in N dimension
-//             if (i == blks - 1) {  // last block
-//                 rows = N - i * 64;
-//             }
+    //B is transposed, shape: N x K
+    else {
+#pragma omp parallel for
+        for (int i = 0; i < blks; ++i) {
+            int rows = BLOCK_N;        // each time pack BLOCK_N elements in N dimension
+            if (i == blks - 1) {  // last block
+                rows = N - i * BLOCK_N;
+            }
 
-//             const int8_t *psrc = B + i * 64 * ldb;
-//             int8_t *pdst = packedB + i * K * 64;
+            const int8_t *psrc = B + i * BLOCK_N * ldb;
+            int8_t *pdst = packedB + i * K * BLOCK_N;
 
-//             for (int c = 0; c < K; ++c) {
-//                 for (int r = 0; r < rows; ++r) {
-//                     pdst[r] = psrc[r * ldb];
-//                 }
-//                 psrc += 1;
-//                 pdst += rows;
-//             }
-//         }
-//     }
+            for (int c = 0; c < K; ++c) {
+                for (int r = 0; r < rows; ++r) {
+                    pdst[r] = psrc[r * ldb];
+                }
+                psrc += 1;
+                pdst += rows;
+            }
+        }
+    }
 }
 
 //per channel
@@ -459,7 +459,7 @@ void benchmark_libxsmm(int M, int N, int K){
     test_utils::init_int8(B, K * ldb);
     test_utils::init(C, M * ldc);  
 
-    pack(B, B_pack, K, N, ldb, false);  
+    pack(B, B_pack, K, N, ldb, false);  //trans_b = false 
 
     //per channel
     float* zero_point_per_channel = (float *)aligned_alloc(64, N * sizeof(float));
@@ -517,22 +517,22 @@ void benchmark_libxsmm(int M, int N, int K){
 
 
 
-void test_gemm(int M, int N, int K) {
+void test_gemm(int M, int N, int K, bool trans_b) {
     int lda = K;
-    int ldb = N;
+    int ldb = trans_b ? K : N;
     int ldc = N;
 
-    float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
-    int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
-    int8_t *B_pack = (int8_t*)aligned_alloc(64, K * ldb * sizeof(int8_t));
-    float *refC = (float *)aligned_alloc(64, M * ldc * sizeof(float));
+    float *A = (float *)aligned_alloc(64, M * K * sizeof(float));
+    int8_t *B = (int8_t *)aligned_alloc(64, K * N * sizeof(int8_t));
+    int8_t *B_pack = (int8_t*)aligned_alloc(64, K * N * sizeof(int8_t));
+    float *refC = (float *)aligned_alloc(64, M * N * sizeof(float));
     zero_fill(refC, M, N, ldc);
 
     test_utils::init(A, M * lda);
-    test_utils::init_int8(B, K * ldb);
-    test_utils::gemm_ref_int8(A, B, refC, M, N, K, lda, ldb, ldc, false);
+    test_utils::init_int8(B, K * N);
+    test_utils::gemm_ref_int8(A, B, trans_b, refC, M, N, K, false);
 
-    pack(B, B_pack, K, N, ldb, false);  
+    pack(B, B_pack, K, N, ldb, trans_b);  
 
 
 
@@ -546,14 +546,14 @@ void test_gemm(int M, int N, int K) {
 
     float *C_per_channel = (float *)aligned_alloc(64, M * ldc * sizeof(float)); 
 
-    my_gemm(A, B_pack, C_per_channel, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel);
+    my_gemm(A, B_pack, C_per_channel, M, N, K, lda, N, ldc, zero_point_per_channel, scale_per_channel);
 
     if (!test_utils::is_same_matrix(refC, C_per_channel, M, N, ldc, 0.0001f)) {
         int idx = test_utils::diff_index(refC, C_per_channel, M, N, ldc, 0.0001f);
-        printf("\tper channel Failed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
-               M, N, K, lda, ldb, ldc, idx, refC[idx], idx, C_per_channel[idx]);
+        printf("\tquant per channel Failed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, trans_b=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
+               M, N, K, lda, ldb, ldc, trans_b, idx, refC[idx], idx, C_per_channel[idx]);
     } else {
-        printf("\tper channel Passed: M=%d, N=%d, K=%d\n", M, N, K);
+        printf("\tquant per channel Passed: M=%d, N=%d, K=%d, trans_b=%d\n", M, N, K, trans_b);
     }
 
 
@@ -564,14 +564,14 @@ void test_gemm(int M, int N, int K) {
 
     float *C_per_tensor = (float *)aligned_alloc(64, M * ldc * sizeof(float)); 
 
-    my_gemm(A, B_pack, C_per_tensor, M, N, K, lda, ldb, ldc, zero_point_per_tensor, scale_per_tensor);
+    my_gemm(A, B_pack, C_per_tensor, M, N, K, lda, N, ldc, zero_point_per_tensor, scale_per_tensor);
 
     if (!test_utils::is_same_matrix(refC, C_per_tensor, M, N, ldc, 0.0001f)) {
         int idx = test_utils::diff_index(refC, C_per_tensor, M, N, ldc, 0.0001f);
-        printf("\tper tensor Failed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
-               M, N, K, lda, ldb, ldc, idx, refC[idx], idx, C_per_tensor[idx]);
+        printf("\tquant per tensor Failed: M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d, trans_b=%d, ref[%d]=%.6f, our[%d]=%.6f\n",
+               M, N, K, lda, ldb, ldc, trans_b, idx, refC[idx], idx, C_per_tensor[idx]);
     } else {
-        printf("\tper tensor Passed: M=%d, N=%d, K=%d\n", M, N, K);
+        printf("\tquant per tensor Passed: M=%d, N=%d, K=%d, trans_b=%d\n", M, N, K, trans_b);
     }      
 
 
@@ -600,7 +600,8 @@ int main() {
 
 
     for (int i = 0; i < sizeof(mnk) / sizeof(mnk[0]); ++i) {
-        test_gemm(mnk[i][0], mnk[i][1], mnk[i][2]);
+        test_gemm(mnk[i][0], mnk[i][1], mnk[i][2], true);
+        test_gemm(mnk[i][0], mnk[i][1], mnk[i][2], false);
         benchmark_libxsmm(mnk[i][0], mnk[i][1], mnk[i][2]);
     }
 

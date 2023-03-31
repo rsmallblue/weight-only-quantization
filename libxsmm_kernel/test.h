@@ -20,18 +20,35 @@ public:
     }
   }
 
-  static void gemm_ref_int8(const float *A, const int8_t *B, float *C, int M, int N, int K, int lda, int ldb, int ldc, bool ACC) {
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < M; ++i) {
-      for (int j = 0; j < N; ++j) {
-        // C[i,j] = SUM(A[i,k] * B[k,j])
-        float sum = ACC ? C[i * ldc + j] : 0;
-        for (int k = 0; k < K; ++k) {
-          sum += A[i * lda + k] * (float)B[k * ldb + j];   
+  static void gemm_ref_int8(const float *A, const int8_t *B, bool trans_b, float *C, int M, int N, int K, bool ACC) {
+    int lda = K, ldc = N, ldb = trans_b?K:N;
+    if(!trans_b){
+      #pragma omp parallel for collapse(2)
+      for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+          // C[i,j] = SUM(A[i,k] * B[k,j])
+          float sum = ACC ? C[i * ldc + j] : 0;
+          for (int k = 0; k < K; ++k) {
+            sum += A[i * lda + k] * (float)B[k * ldb + j];   
+          }
+          C[i * ldc + j] = sum;
         }
-        C[i * ldc + j] = sum;
       }
     }
+    else{
+      #pragma omp parallel for collapse(2)
+      for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+          // C[i,j] = SUM(A[i,k] * B[k,j])
+          float sum = ACC ? C[i * ldc + j] : 0;
+          for (int k = 0; k < K; ++k) {
+            sum += A[i * lda + k] * (float)B[j * ldb + k];   
+          }
+          C[i * ldc + j] = sum;
+        }
+      }      
+    }
+
   }
 
   static void add_bias(float *C, float *bias, int M, int N, int ldc) {
