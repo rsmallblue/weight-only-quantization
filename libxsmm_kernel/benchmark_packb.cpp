@@ -3,7 +3,75 @@
 #include "gemm_kernel.h"
 // const int BLOCK_M = 4, BLOCK_N = 64, BLOCK_K = 256;
 
+void benchmark_libxsmm(int M, int N, int K){
+    const int lda = K;
+    const int ldb = N;
+    const int ldc = N;
 
+    float *A = (float *)aligned_alloc(64, M * lda * sizeof(float));
+    int8_t *B = (int8_t *)aligned_alloc(64, K * ldb * sizeof(int8_t));
+    int8_t *B_pack = (int8_t*)aligned_alloc(64, K * ldb * sizeof(int8_t));
+    float *C = (float *)aligned_alloc(64, M * ldc * sizeof(float));
+    float *bias = (float *)aligned_alloc(64, N * sizeof(float));
+
+    test_utils::init(A, M * lda);
+    test_utils::init_int8(B, K * ldb); 
+    test_utils::init(bias, N);
+
+    pack(B, B_pack, K, N, ldb, false);  //trans_b = false 
+
+    //per channel
+    int32_t* zero_point_per_channel = (int32_t *)aligned_alloc(64, N * sizeof(float));
+    float* scale_per_channel = (float *)aligned_alloc(64, N * sizeof(float));  
+    for(int i = 0 ; i < N; i++){
+        zero_point_per_channel[i] = 0;
+        scale_per_channel[i] = 1.0;
+    } 
+
+    //warmup
+    for (int i = 0; i < 10; ++i) {
+        woq_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel, bias);
+    }
+
+    Timer t1;
+    const int loops = 100;
+    for (int i = 0; i < loops; ++i) {
+        woq_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_channel, scale_per_channel, bias);
+    }
+
+    float latency = t1.getTime();
+    float gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
+    printf("libxsmm_kernel per_channel, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
+
+
+
+    //per tensor
+    float zero_point_per_tensor = 0.0;
+    float scale_per_tensor = 1.0;  
+
+
+    //warmup
+    for (int i = 0; i < 10; ++i) {
+        woq_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_tensor, scale_per_tensor, bias);
+    }
+
+    Timer t2;
+    for (int i = 0; i < loops; ++i) {
+        woq_gemm(A, B_pack, C, M, N, K, lda, ldb, ldc, zero_point_per_tensor, scale_per_tensor, bias);
+    }
+
+    latency = t2.getTime();
+    gflops = 2LL * M * N * K  / (latency / loops) / 1000000;
+    printf("libxsmm_kernel per_tensor, M: %d, N: %d, K: %d, time: %.6f ms, perf: %.6f gflops\n", M, N, K, latency / loops, gflops);
+
+
+    free(A);
+    free(B);
+    free(B_pack);
+    free(C);  
+    free(zero_point_per_channel);
+    free(scale_per_channel);
+}
 
 void test_gemm(int M, int N, int K, bool trans_b) {
     int lda = K;
@@ -85,9 +153,9 @@ void test_gemm(int M, int N, int K, bool trans_b) {
 
 int main() {
     int mnk[][3] = {
-        {7, 4095, 4095},
-        {7, 16383, 4095},
-        {7, 4095,16383},
+        // {7, 4095, 4095},
+        // {7, 16383, 4095},
+        // {7, 4095,16383},
         {4, 4096, 4096},
         {4, 4096, 16384},
         {4, 16384, 4096},
@@ -95,9 +163,9 @@ int main() {
 
 
     for (int i = 0; i < sizeof(mnk) / sizeof(mnk[0]); ++i) {
-        test_gemm(mnk[i][0], mnk[i][1], mnk[i][2], true);
-        test_gemm(mnk[i][0], mnk[i][1], mnk[i][2], false);
-        //benchmark_libxsmm(mnk[i][0], mnk[i][1], mnk[i][2]);
+        // test_gemm(mnk[i][0], mnk[i][1], mnk[i][2], true);
+        // test_gemm(mnk[i][0], mnk[i][1], mnk[i][2], false);
+        benchmark_libxsmm(mnk[i][0], mnk[i][1], mnk[i][2]);
     }
 
     return 0;
