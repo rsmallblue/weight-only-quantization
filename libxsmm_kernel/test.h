@@ -20,7 +20,7 @@ public:
     }
   }
 
-  static void gemm_ref_int8(const float *A, const int8_t *B, bool trans_b, float *C, int M, int N, int K, bool ACC) {
+  static void gemm_ref(const float *A, const int8_t *B, bool trans_b, float *C, int M, int N, int K, bool ACC) {
     int lda = K, ldc = N, ldb = trans_b?K:N;
     if(!trans_b){
       #pragma omp parallel for collapse(2)
